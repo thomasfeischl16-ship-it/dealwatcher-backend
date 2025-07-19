@@ -1,64 +1,38 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import asyncio
-from playwright.async_api import async_playwright
+import requests
+from bs4 import BeautifulSoup
 
 app = FastAPI()
 
-class Product(BaseModel):
+# Eingabemodell
+class TrackRequest(BaseModel):
     url: str
 
-price_history = {}
-
-async def scrape_price(url: str):
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        await page.goto(url)
-
-        # Amazon Beispiel
-        price_selectors = [
-            "#priceblock_ourprice",      # Amazon normal
-            "#priceblock_dealprice",     # Amazon Angebote
-            ".price",                    # Otto / Alternate
-            ".product-price",            # MediaMarkt/Saturn
-        ]
-
-        price = None
-        for selector in price_selectors:
-            try:
-                element = await page.query_selector(selector)
-                if element:
-                    price_text = await element.inner_text()
-                    price = price_text.strip().replace("€", "").replace(",", ".")
-                    price = float(price)
-                    break
-            except:
-                continue
-
-        await browser.close()
-
-        if price is None:
-            raise Exception("Kein Preis gefunden. Selektor prüfen oder Shop blockiert Bots.")
-        return price
-
 @app.post("/track_price")
-async def track_price(product: Product):
-    url = product.url
+def track_price(request: TrackRequest):
+    url = request.url
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36"
+    }
 
     try:
-        price = await scrape_price(url)
+        # HTML der Seite laden
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail="Failed to load page.")
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # Amazon Beispiel: Preis parsen
+        price_element = soup.select_one("#priceblock_ourprice, #priceblock_dealprice")
+        if price_element:
+            price = price_element.get_text(strip=True)
+        else:
+            price = "Price not found"
+
+        return {"url": url, "current_price": price}
+
     except Exception as e:
-        return {"error": str(e)}
-
-    # Preisverlauf speichern
-    if url not in price_history:
-        price_history[url] = []
-    price_history[url].append(price)
-
-    return {
-        "url": url,
-        "current_price": price,
-        "history": price_history[url]
-    }
+        raise HTTPException(status_code=500, detail=f"Error fetching price: {str(e)}")
 
