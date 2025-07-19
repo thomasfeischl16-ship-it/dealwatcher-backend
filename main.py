@@ -12,12 +12,13 @@ class PriceRequest(BaseModel):
 def get_price_from_html(html):
     soup = BeautifulSoup(html, "html.parser")
 
-    # 🟣 1. BeautifulSoup: versuche bekannte Preis-Selector
+    # 🟢 Schritt 1: BeautifulSoup mit präziseren Selector
     possible_selectors = [
-        {"name": "span", "attrs": {"class": "product-price"}},        # Otto Beispiel
-        {"name": "span", "attrs": {"id": "priceblock_ourprice"}},     # Amazon Beispiel
-        {"name": "div", "attrs": {"class": "price"}},                 # Generische Beispiele
-        {"name": "span", "attrs": {"class": "a-price-whole"}}         # Amazon fallback
+        {"name": "span", "attrs": {"class": "product-price__price"}},  # Otto (präzise)
+        {"name": "span", "attrs": {"id": "priceblock_ourprice"}},      # Amazon
+        {"name": "span", "attrs": {"id": "priceblock_dealprice"}},     # Amazon Deal-Preis
+        {"name": "span", "attrs": {"class": "a-price-whole"}},         # Amazon fallback
+        {"name": "div", "attrs": {"class": "price"}},                  # generisch
     ]
 
     for selector in possible_selectors:
@@ -25,13 +26,20 @@ def get_price_from_html(html):
         if price_tag:
             price_text = price_tag.get_text(strip=True)
             if price_text:
-                return price_text, "BeautifulSoup"
+                return price_text, "BeautifulSoup (precise selector)"
 
-    # 🟣 2. Regex Fallback
-    prices = re.findall(r"\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?\s?€", html)
+    # 🟢 Schritt 2: Fallback – nur Main-Content durchsuchen
+    main_content = soup.find("main")
+    if main_content:
+        html_to_search = str(main_content)
+    else:
+        html_to_search = html
+
+    prices = re.findall(r"\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?\s?€", html_to_search)
     if prices:
-        return prices[0], "Regex fallback"
+        return prices[0], "Regex fallback (main content)"
 
+    # 🟢 Schritt 3: Kein Preis gefunden
     return None, None
 
 @app.post("/track_price")
@@ -59,6 +67,3 @@ def track_price(request: PriceRequest):
 
     except requests.exceptions.RequestException as e:
         raise HTTPException(status_code=500, detail=f"Error fetching page: {e}")
-
-
-
