@@ -1,116 +1,96 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 import requests
 from bs4 import BeautifulSoup
 import re
-
-# Playwright-Import
-from playwright.sync_api import sync_playwright
+import json
+import asyncio
+from playwright.async_api import async_playwright
 
 app = FastAPI()
 
+# === Helper Functions ===
+async def fetch_price_with_playwright(url: str):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+        )
+        await page.goto(url, timeout=60000)
+
+        # Try various selectors for price
+        selectors = [
+            '[id*="price"]',
+            '[class*="price"]',
+            'span:has-text("€")',
+            'span:has-text("$")'
+        ]
+
+        price_text = None
+        for selector in selectors:
+            try:
+                element = await page.query_selector(selector)
+                if element:
+                    text = await element.inner_text()
+                    price_match = re.search(r"[\d.,]+", text)
+                    if price_match:
+                        price_text = price_match.group(0)
+                        break
+            except:
+                continue
+
+        await browser.close()
+
+        if not price_text:
+            raise HTTPException(status_code=404, detail="Price not found with Playwright")
+        return price_text
+
+
+def fetch_price_with_requests(url: str):
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"
+    }
+    response = requests.get(url, headers=headers, timeout=15)
+    if response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail=f"Error fetching page: {response.status_code}")
+
+    soup = BeautifulSoup(response.content, "html.parser")
+    selectors = [
+        '[id*="price"]',
+        '[class*="price"]',
+        'span:has-text("€")',
+        'span:has-text("$")'
+    ]
+
+    for selector in selectors:
+        element = soup.select_one(selector)
+        if element:
+            price_match = re.search(r"[\d.,]+", element.get_text())
+            if price_match:
+                return price_match.group(0)
+
+    raise HTTPException(status_code=404, detail="Price not found with requests")
+
+
+# === API Endpoints ===
 class PriceRequest(BaseModel):
-    url: str | None = None
-    shop: str | None = None
-    article_number: str | None = None
-
-# 🟢 Funktion: Baue URL aus Shop & Artikelnummer
-def build_url_from_article(shop, article_number):
-    shop = shop.lower()
-    if shop == "amazon":
-        return f"https://www.amazon.de/dp/{article_number}"
-    elif shop == "otto":
-        return f"https://www.otto.de/p/{article_number}/"
-    elif shop == "mediamarkt":
-        return f"https://www.mediamarkt.de/de/product/_{article_number}.html"
-    elif shop == "conrad":
-        return f"https://www.conrad.de/de/p/{article_number}.html"
-    else:
-        return None
-
-# 🟢 Playwright: Hole den Preis aus dynamischen Seiten
-def get_price_with_playwright(url):
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(url, timeout=20000)  # 20 Sekunden Timeout
-
-            # Warte bis Preis geladen ist
-            page.wait_for_timeout(3000)  # 3 Sek. warten
-
-            content = page.content()
-            browser.close()
-
-            # BeautifulSoup zum Parsen nutzen
-            soup = BeautifulSoup(content, "html.parser")
-            possible_selectors = [
-                {"name": "span", "attrs": {"id": "priceblock_ourprice"}},  # Amazon
-                {"name": "span", "attrs": {"id": "priceblock_dealprice"}}, # Amazon
-                {"name": "span", "attrs": {"class": "product-price__price"}}, # Otto
-                {"name": "div", "attrs": {"class": "m-price__price"}},  # MediaMarkt
-            ]
-
-            for selector in possible_selectors:
-                price_tag = soup.find(selector["name"], selector["attrs"])
-                if price_tag:
-                    price_text = price_tag.get_text(strip=True)
-                    if "€" in price_text:
-                        return price_text, "Playwright"
-
-            return None, None
-    except Exception as e:
-        print(f"Playwright Error: {e}")
-        return None, None
-
-# 🟢 BeautifulSoup Fallback
-def get_price_with_bs(html):
-    soup = BeautifulSoup(html, "html.parser")
-    prices = re.findall(r"\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?\s?€", html)
-    if prices:
-        return prices[0], "BeautifulSoup fallback"
-    return None, None
+    url: str
 
 @app.post("/track_price")
-def track_price(request: PriceRequest):
+async def track_price(req: PriceRequest):
     try:
-        # 🟣 Prüfe ob URL oder Artikelnummer verwendet wird
-        if request.url:
-            url = request.url
-        elif request.shop and request.article_number:
-            url = build_url_from_article(request.shop, request.article_number)
-            if not url:
-                raise HTTPException(status_code=400, detail="Unsupported shop or invalid article number.")
-        else:
-            raise HTTPException(status_code=400, detail="Provide either URL or (shop + article_number).")
+        # Try with requests first
+        price = fetch_price_with_requests(req.url)
+        return {"url": req.url, "current_price": price}
+    except:
+        # Fallback to Playwright if requests fail
+        try:
+            price = await fetch_price_with_playwright(req.url)
+            return {"url": req.url, "current_price": price}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Playwright also failed: {str(e)}")
 
-        # 🟢 Versuche Playwright
-        price, method = get_price_with_playwright(url)
-        if price:
-            return {
-                "url": url,
-                "current_price": price,
-                "method": method
-            }
-
-        # 🟣 Fallback: BeautifulSoup
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        price, method = get_price_with_bs(response.text)
-
-        if price:
-            return {
-                "url": url,
-                "current_price": price,
-                "method": method
-            }
-        else:
-            return {
-                "url": url,
-                "current_price": "Price not found",
-                "method": None
-            }
-
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching page: {e}")
